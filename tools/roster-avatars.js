@@ -38,7 +38,7 @@ const pool = async (items, n, fn) => {
 
 ;(async () => {
   fs.mkdirSync(AVA_DIR, { recursive: true })
-  const roster = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'roster.json'), 'utf8'))
+  const roster = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'relay', 'roster.json'), 'utf8'))
   const ids = []
   for (const r of roster) if (r && r.mnid) ids.push(String(r.mnid))
   try {   // 榜上 id 并入：新上榜的女优 roster 快照可能还没收录
