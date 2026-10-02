@@ -1,0 +1,44 @@
+# minnano 全量资料页回填：Actions 机房直连 minnano（家宽 SNI 阻断、数据中心代理被 WAF 403，
+# 只有 Actions 的 IP 能抓）。补全 愛称 / 公式サイト / 现用名 mcanon / 別名 等主仓旧解析器漏掉的字段，
+# 写回 relay/roster.json，NAS 容器每日 04:00 自动合并收货。
+name: profiles-relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'full = 全量 ~2.5 万页（1~2 小时）；留空 = 只补缺 愛称/公式サイト 的'
+        required: false
+        default: 'full'
+  schedule:
+    - cron: '50 22 * * *'   # UTC 22:50 = 北京时间 06:50，排在 rank-relay（21:30）之后
+
+permissions:
+  contents: write
+
+concurrency:
+  group: profiles-relay
+  cancel-in-progress: false
+
+jobs:
+  profiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 抓取 minnano 资料页并回填名册
+        run: node tools/profiles-relay.js ${{ github.event.inputs.scope || '' }}
+      - name: 提交 relay 数据
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add relay/roster.json
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "relay: minnano 资料页回填 $(date -u +%F)"
+            git push
+          fi
