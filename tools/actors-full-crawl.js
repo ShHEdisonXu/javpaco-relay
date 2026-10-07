@@ -11,6 +11,7 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { execSync } = require('child_process')
 
 /* ---- JavDB 移动端 API：国内线路 + 应用级签名（照抄 server.js 的 jdbSign） ---- */
 const JDB_LINES = ['https://apidd.spthgb.com', 'https://apidd.czssdgz.com', 'https://jdforrepam.com']
@@ -175,9 +176,8 @@ async function fixActressesWithoutIcon(byId) {
     } catch (_) {}
     fix[a.name] = rec
   })
-  const tmp = FIX_OUT + '.tmp'
-  fs.writeFileSync(tmp, JSON.stringify({ fetchedAt: Date.now(), count: Object.keys(fix).length, map: fix }))
-  fs.renameSync(tmp, FIX_OUT)
+  // ⚠️ 不用 renameSync：沙箱/部分文件系统会拦「覆盖式 rename」，直接 writeFileSync 覆盖
+  fs.writeFileSync(FIX_OUT, JSON.stringify({ fetchedAt: Date.now(), count: Object.keys(fix).length, map: fix }))
   const withJdb = Object.values(fix).filter(x => x.avatar_url).length
   const withMn = Object.values(fix).filter(x => !x.avatar_url && x.mimg).length
   console.log('   relay/actress_fix.json：共 ' + Object.keys(fix).length + ' 条 · JavDB 图 ' + withJdb + '（本次 +' + gotJdb + '）· JavDB 无图但名册有 minnano 原图 ' + withMn)
@@ -207,8 +207,42 @@ function loadFemaleNames() {
 function genderOf(a) {
   const fem = loadFemaleNames()
   const keys = [a.name, a.name_zht].concat(String(a.other_name || '').split(/[,，、]/))
-  for (const k of keys) { if (k && fem.has(onNorm(k))) return 'f' }
-  return 'm'
+  for (const k of keys) { if (k && fem.has(onNorm(k))) return { gender: 'f', rosterHit: true } }
+  // 名册没命中 → 「可能是男优」，但必须过网页版复核：
+  // 实测名册反查漏判率极高（欧美/无码厂演员大多不在 minnano 名册里），
+  // 第一版 256 个「男优」里 152 个（59%）其实是女优。
+  return { gender: 'm', rosterHit: false }
+}
+
+/* ---- 性别复核：JavDB 网页版演员页的 section-meta（权威判据） ----
+ * https://javdb.com/actors/<id> 里 <span class="section-meta"> 的内容：
+ *   男优页 → 「男優, 5415 部影片」     女优页 → 「81 部影片」（不带性别字样）
+ * ⇒ 规则：所有 section-meta 里有「男優」= 男优，没有 = 女优。
+ * ⚠️ 必须 matchAll：section-meta 有多个，第一个常是**别名标签**
+ *   （鮫島页面的「鮫島健介」、黒田悠斗的「黒田将稔…」），只取第一个会把真男优判成女优。
+ * ⚠️ 网页版要出海才拿得到：本地跑需 WEB_PROXY（默认 127.0.0.1:1082）；GitHub Actions 机房直连。
+ * 拿不到页面时返回 null（保留名册反查的结果，不硬改）。 */
+const WEB_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+const WEB_PROXY = process.env.WEB_PROXY || (process.env.WEB_GENDER_LOCAL ? 'http://127.0.0.1:1082' : '')
+const WEB_ON = process.env.WEB_GENDER !== '0'
+let WEB_DEAD = false          // 连续失败到阈值就整轮放弃，别傻等
+let webFailStreak = 0
+function webGenderOf(id) {
+  if (WEB_DEAD) return null
+  const cmd = `curl -s --max-time 25 ${WEB_PROXY ? '-x ' + WEB_PROXY + ' ' : ''}-A "${WEB_UA}" "https://javdb.com/actors/${id}"`
+  let h = ''
+  try {
+    const env = { ...process.env }
+    ;['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'].forEach(k => delete env[k])
+    h = execSync(cmd, { encoding: 'utf8', timeout: 30000, env, stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch (_) { h = '' }
+  const metas = [...String(h).matchAll(/section-meta">([^<]+)</g)].map(x => x[1])
+  if (!metas.length) {
+    if (++webFailStreak >= 15) { WEB_DEAD = true; console.log('   ⚠ 网页版连续 15 次取不到（被墙/风控），本轮放弃复核，保留名册反查结果') }
+    return null
+  }
+  webFailStreak = 0
+  return metas.some(t => /男優/.test(t)) ? 'm' : 'f'
 }
 
 ;(async () => {
@@ -265,14 +299,15 @@ function genderOf(a) {
     try { a = ((await jdbGet('v1/actors/' + encodeURIComponent(id))) || {}).data || {} } catch (_) { return }
     const ac = a.actor || {}
     if (!ac.id || !ac.name) return
-    // 性别：名册反查（可靠）；JavDB 三围不可靠（见 genderOf 注释）
-    const gender = genderOf(ac)
+    // 性别：名册命中 = 女优（可靠）；没命中 → 先标 pending，稍后统一过网页版复核
+    const g = genderOf(ac)
     byId.set(id, {
       id: ac.id,
       name: ac.name || '',
       name_zht: ac.name_zht || '',
       other_name: ac.other_name || '',
-      gender,
+      gender: g.gender,
+      genderSource: g.rosterHit ? 'roster' : 'pending-web',
       avatar_url: ac.avatar_url || '',
       birthday: ac.birthday || '',
       age: ac.age != null ? ac.age : '',
@@ -293,6 +328,20 @@ function genderOf(a) {
     if (done % 20 === 0) console.log('   新抓 ' + done + '/' + todo.length)
   })
 
+  /* ②b 性别复核：本次新抓且名册没命中的，逐个问网页版 section-meta。
+   * 旧记录（已在文件里）性别已定，不重复问，避免每天全量重跑 1000 次请求。 */
+  const pending = todo.map(id => byId.get(id)).filter(r => r && r.genderSource === 'pending-web')
+  if (WEB_ON && pending.length) {
+    console.log('②b 性别复核（网页版 section-meta）：' + pending.length + ' 位…')
+    await pool(pending, 8, async r => {
+      const g = webGenderOf(r.id)
+      if (g) { r.gender = g; r.genderSource = 'javdb-web-section-meta' }
+      else r.genderSource = r.genderSource === 'pending-web' ? 'roster-heuristic' : r.genderSource
+    })
+    const fixF = pending.filter(r => r.gender === 'f').length
+    console.log('   复核结果：女优 ' + fixF + ' · 男优 ' + (pending.length - fixF) + (WEB_DEAD ? '（网页版不可用，部分保留名册反查）' : ''))
+  }
+
   const list = [...byId.values()].sort((a, b) => (Number(b.videos_count) || 0) - (Number(a.videos_count) || 0))
   const out = {
     fetchedAt: Date.now(),
@@ -300,11 +349,10 @@ function genderOf(a) {
     count: list.length,
     female: list.filter(a => a.gender === 'f').length,
     male: list.filter(a => a.gender === 'm').length,
+    genderSource: 'javdb-web-section-meta+roster',
     list
   }
-  const tmp = OUT_JSON + '.tmp'
-  fs.writeFileSync(tmp, JSON.stringify(out))
-  fs.renameSync(tmp, OUT_JSON)
+  fs.writeFileSync(OUT_JSON, JSON.stringify(out))
   console.log('③ relay/actors_full.json 已生成：共 ' + out.count + ' 位（女优 ' + out.female + ' · 男优 ' + out.male + '）')
 
   /* ⑤ 名册里没头像的女优 → 用 JavDB 资料+头像补（名册 4.6% 缺头像，前端原来拿影片封面顶着）
