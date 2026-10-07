@@ -23,18 +23,24 @@ concurrency:
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 60          # 两个爬虫合计约 30 分钟
+    timeout-minutes: 90
+    env:
+      # ⚠️ 两个脚本默认把产物写在「脚本同级的 relay/」，但 Actions 里脚本在 tools/ 下，
+      #    仓库根的 relay/ 在上一层 —— 不指定就会写 tools/relay/ 直接 ENOENT 挂掉整个 job。
+      RELAY_DIR: relay
+      # 无码名单翻页数（约 203 页饱和，给 300 留余量）；全量演员每维度翻页数
+      UC_PAGES: ${{ inputs.full == 'full' && '600' || '300' }}
+      MOVIE_PAGES: ${{ inputs.full == 'full' && '80' || '40' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # 性别判据：网页版 https://javdb.com/actors/<id> 的 section-meta（含「男優」= 男优）。
+      # Actions 机房可直连 javdb.com；仓库里没有 actresses.json（名册），名册反查那一级自动跳过。
       - name: 抓 JavDB 无码演员名单（翻 type=1 无码影片反推）
         run: node tools/uncensored-actresses-crawl.js
       - name: 抓 JavDB 全量演员 + 女优补图
-        env:
-          # 名册用于性别反查与补图目标；仓库里没有 actresses.json 时自动跳过该环节
-          RELAY_DIR: relay
         run: node tools/actors-full-crawl.js
       - name: 提交 relay 数据
         run: |
