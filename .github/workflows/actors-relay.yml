@@ -1,0 +1,49 @@
+# JavDB 演员数据每日更新：全量演员（男女统一）+ 无码演员名单。
+# Actions 机房直连 JavDB 国内线路（应用级签名，与账号无关），无需翻墙。
+# 抓取原理见 tools/ 里两个脚本的注释：JavDB 没有演员目录端点，只能从影片反推。
+name: actors-relay
+
+on:
+  schedule:
+    - cron: '10 22 * * *'   # UTC 22:10 = 北京 06:10（错开 rank-relay 21:30 / male-roster 21:40）
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '填 full = 翻更多无码影片页（默认 260，约 203 页即饱和）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: actors-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60          # 两个爬虫合计约 30 分钟
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 抓 JavDB 无码演员名单（翻 type=1 无码影片反推）
+        run: node tools/uncensored-actresses-crawl.js
+      - name: 抓 JavDB 全量演员 + 女优补图
+        env:
+          # 名册用于性别反查与补图目标；仓库里没有 actresses.json 时自动跳过该环节
+          RELAY_DIR: relay
+        run: node tools/actors-full-crawl.js
+      - name: 提交 relay 数据
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add relay/uncensored_actresses.json relay/actors_full.json relay/actress_fix.json relay/avatars_jdb/
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "relay: JavDB 演员与无码名单更新 $(date -u +%F)"
+            git push
+          fi
