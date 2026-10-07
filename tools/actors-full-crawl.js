@@ -194,9 +194,18 @@ let FEM_NAMES = null
 function loadFemaleNames() {
   if (FEM_NAMES) return FEM_NAMES
   FEM_NAMES = new Set()
-  const ROSTER = path.join(RELAY_DIR, '..', 'actresses.json')
+  /* ⚠️ 优先读 relay/female_names.json（精简版名册，0.75MB，已进仓库）：
+   * GitHub Actions 仓库里没有 16MB 的 actresses.json，没有它名册反查会整个失效
+   * → 新抓的演员全被判成男优（2026-10-07 实测一次跑进去 21 个假男优）。 */
   let roster = []
-  try { roster = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) || [] } catch (_) {}
+  try {
+    const fn = JSON.parse(fs.readFileSync(path.join(RELAY_DIR, 'female_names.json'), 'utf8')) || {}
+    roster = (fn.names || []).map(n => ({ name: n }))
+  } catch (_) {}
+  if (!roster.length) {
+    const ROSTER = path.join(RELAY_DIR, '..', 'actresses.json')
+    try { roster = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) || [] } catch (_) {}
+  }
   const push = n => { const k = onNorm(n); if (k) FEM_NAMES.add(k) }
   for (const a of roster) {
     if (!a || !a.name) continue
@@ -206,6 +215,29 @@ function loadFemaleNames() {
   }
   return FEM_NAMES
 }
+/* 回写 relay/female_names.json：把本次判定为女优的名字（含别名）并进精简名册。
+ * 名册每天会漂移（新出道的女优），不回写的话 Actions 侧的反查名单会越用越旧，
+ * 新演员就又只能靠「不是女优就是男优」瞎猜。 */
+function updateFemaleNames(list) {
+  try {
+    const p = path.join(RELAY_DIR, 'female_names.json')
+    const names = new Set()
+    try { ((JSON.parse(fs.readFileSync(p, 'utf8')) || {}).names || []).forEach(n => names.add(n)) } catch (_) {}
+    const before = names.size
+    for (const a of list) {
+      if (!a || a.gender !== 'f') continue
+      ;[a.name, a.name_zht].concat(String(a.other_name || '').split(/[,，、]/)).forEach(n => {
+        n = String(n || '').trim()
+        if (n && n.length < 60) names.add(n)
+      })
+    }
+    if (names.size !== before) {
+      fs.writeFileSync(p, JSON.stringify({ fetchedAt: Date.now(), source: 'minnano-roster+javdb-verified', count: names.size, names: [...names] }))
+      console.log('   relay/female_names.json：' + before + ' → ' + names.size + ' 个女优名字')
+    }
+  } catch (_) {}
+}
+
 function genderOf(a) {
   const fem = loadFemaleNames()
   const keys = [a.name, a.name_zht].concat(String(a.other_name || '').split(/[,，、]/))
@@ -222,7 +254,9 @@ function genderOf(a) {
  * ⇒ 规则：所有 section-meta 里有「男優」= 男优，没有 = 女优。
  * ⚠️ 必须 matchAll：section-meta 有多个，第一个常是**别名标签**
  *   （鮫島页面的「鮫島健介」、黒田悠斗的「黒田将稔…」），只取第一个会把真男优判成女优。
- * ⚠️ 网页版要出海才拿得到：本地跑需 WEB_PROXY（默认 127.0.0.1:1082）；GitHub Actions 机房直连。
+ * ⚠️ GitHub Actions 拿不到：javdb.com 挂在 Cloudflare 后面，机房 IP 一律 403「Just a moment...」
+ *   （2026-10-07 实测：Actions 里 curl code=403，本地/家庭宽带直连 200）。所以 Actions 侧
+ *   性别主要靠 relay/female_names.json 的名册反查，网页版只作为本地补充手段。
  * 拿不到页面时返回 null（保留名册反查的结果，不硬改）。 */
 const WEB_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 const WEB_PROXY = process.env.WEB_PROXY || (process.env.WEB_GENDER_LOCAL ? 'http://127.0.0.1:1082' : '')
@@ -292,6 +326,8 @@ function webGenderOf(id) {
   /* ② 合并上次结果，只补没抓过的 */
   const prev = loadPrev()
   const byId = new Map((prev.list || []).map(a => [a.id, a]))
+  const PREV_BY_ID = byId                                        // 安全阀用：还原上一版性别
+  const MALE_BEFORE = (prev.list || []).filter(a => a.gender === 'm').length
   const todo = [...found.keys()].filter(id => !byId.get(id))
   console.log('② 已有 ' + byId.size + ' 个，需新抓 ' + todo.length + ' 个')
 
@@ -354,7 +390,18 @@ function webGenderOf(id) {
     genderSource: 'javdb-web-section-meta+roster',
     list
   }
+
+  /* ⚠️ 安全阀：名册（female_names.json）读不到 + 网页版也取不到 → 本次新增的性别全是瞎猜，
+   * 会把一批女优写进「男优」tab。这种情况只更新资料、不动名单：还原成上一版的性别。 */
+  const FEM_COUNT = loadFemaleNames().size
+  if (WEB_DEAD && !FEM_COUNT && (out.male - MALE_BEFORE > 5)) {
+    console.log(`⚠ 名册缺失且网页版不可用 → 本次新增的 ${out.male - MALE_BEFORE} 位性别不可信，按上一版还原，不写入新性别`)
+    for (const r of pending) { const o = PREV_BY_ID.get(r.id); if (o) { r.gender = o.gender; r.genderSource = o.genderSource || 'prev' } else { r.gender = 'f'; r.genderSource = 'unverified-default-f' } }
+    out.female = list.filter(a => a.gender === 'f').length
+    out.male = list.filter(a => a.gender === 'm').length
+  }
   fs.writeFileSync(OUT_JSON, JSON.stringify(out))
+  updateFemaleNames(list)
   console.log('③ relay/actors_full.json 已生成：共 ' + out.count + ' 位（女优 ' + out.female + ' · 男优 ' + out.male + '）')
 
   /* ⑤ 名册里没头像的女优 → 用 JavDB 资料+头像补（名册 4.6% 缺头像，前端原来拿影片封面顶着）
