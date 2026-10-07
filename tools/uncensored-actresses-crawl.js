@@ -69,9 +69,17 @@ let FEM_NAMES = null
 function loadFemaleNames() {
   if (FEM_NAMES) return FEM_NAMES
   FEM_NAMES = new Set()
-  const ROSTER = path.join(RELAY_DIR, '..', 'actresses.json')
+  /* ⚠️ 优先读 relay/female_names.json（精简版名册 0.75MB，已进仓库）：Actions 里没有 16MB 的
+   * actresses.json，没有它名册反查会整个失效 → 无码演员会被全判成男优。 */
   let roster = []
-  try { roster = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) || [] } catch (_) {}
+  try {
+    const fn = JSON.parse(fs.readFileSync(path.join(RELAY_DIR, 'female_names.json'), 'utf8')) || {}
+    roster = (fn.names || []).map(n => ({ name: n }))
+  } catch (_) {}
+  if (!roster.length) {
+    const ROSTER = path.join(RELAY_DIR, '..', 'actresses.json')
+    try { roster = JSON.parse(fs.readFileSync(ROSTER, 'utf8')) || [] } catch (_) {}
+  }
   const push = n => { const k = onNorm(n); if (k) FEM_NAMES.add(k) }
   for (const a of roster) {
     if (!a || !a.name) continue
