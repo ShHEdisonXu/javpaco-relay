@@ -12,6 +12,7 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { execSync } = require('child_process')
 
 /* ---- JavDB 移动端 API：国内线路 + 应用级签名（照抄 server.js 的 jdbSign） ---- */
 const JDB_LINES = ['https://apidd.spthgb.com', 'https://apidd.czssdgz.com', 'https://jdforrepam.com']
@@ -22,7 +23,9 @@ function jdbSign() {
   return ts + '.' + JDB_P2 + '.' + crypto.createHash('md5').update(String(ts) + JDB_P1).digest('hex')
 }
 
-const RELAY_DIR = process.env.RELAY_DIR || path.join(__dirname, 'relay')
+// ⚠️ Actions 里脚本在 tools/ 下跑，仓库根的 relay/ 在上一层；本地自测时脚本和 relay/ 同级。
+const RELAY_DIR = process.env.RELAY_DIR ||
+  (path.basename(__dirname) === 'tools' ? path.join(__dirname, '..', 'relay') : path.join(__dirname, 'relay'))
 const OUT_JSON = path.join(RELAY_DIR, 'uncensored_actresses.json')
 const TIMEOUT = 20000
 const PAGES = +(process.env.UC_PAGES || 120)       // 翻多少页无码影片（每页 30 部）
@@ -79,6 +82,58 @@ function loadFemaleNames() {
   return FEM_NAMES
 }
 
+/* ---- 性别复核：JavDB 网页版演员页的 section-meta（权威判据，照抄 actors-full-crawl.js） ----
+ * 有多个 section-meta，第一个常是别名标签 → 必须 matchAll；含「男優」= 男优，否则女优。
+ * 网页版要出海：本地跑需 WEB_PROXY（默认 127.0.0.1:1082），GitHub Actions 机房直连。 */
+const WEB_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+const WEB_PROXY = process.env.WEB_PROXY || (process.env.WEB_GENDER_LOCAL ? 'http://127.0.0.1:1082' : '')
+const WEB_ON = process.env.WEB_GENDER !== '0'
+let WEB_DEAD = false, webFailStreak = 0
+function webGenderOf(id) {
+  if (WEB_DEAD) return null
+  const cmd = `curl -s --max-time 25 ${WEB_PROXY ? '-x ' + WEB_PROXY + ' ' : ''}-A "${WEB_UA}" "https://javdb.com/actors/${id}"`
+  let h = ''
+  try {
+    const env = { ...process.env }
+    ;['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'].forEach(k => delete env[k])
+    h = execSync(cmd, { encoding: 'utf8', timeout: 30000, env, stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch (_) { h = '' }
+  const metas = [...String(h).matchAll(/section-meta">([^<]+)</g)].map(x => x[1])
+  if (!metas.length) {
+    if (++webFailStreak >= 15) { WEB_DEAD = true; console.log('   ⚠ 网页版连续 15 次取不到（被墙/风控），本轮放弃复核') }
+    return null
+  }
+  webFailStreak = 0
+  return metas.some(t => /男優/.test(t)) ? 'm' : 'f'
+}
+
+/* 上一版名单里的性别（按 id / 名字复用）：判定不出新结果时兜底，避免把已定好的性别改坏 */
+function loadPrevGender() {
+  const m = new Map()
+  let female = 0
+  try {
+    const p = JSON.parse(fs.readFileSync(OUT_JSON, 'utf8')) || {}
+    for (const a of (p.list || [])) {
+      if (!a) continue
+      if (a.gender === 'f') female++          // 按「名单条数」统计，用于安全阀比对
+      if (a.id && a.gender) m.set('id:' + a.id, a.gender)
+      const n = onNorm(a.name)
+      if (n && a.gender) m.set('n:' + n, a.gender)
+    }
+  } catch (_) {}
+  return { map: m, female }
+}
+
+/* 已判定过性别的全量演员表（actors_full.json）：同一 id 直接复用，省一次请求 */
+function loadActorsFullGender() {
+  const m = new Map()
+  try {
+    const p = JSON.parse(fs.readFileSync(path.join(RELAY_DIR, 'actors_full.json'), 'utf8')) || {}
+    for (const a of (p.list || [])) if (a && a.id && a.gender) m.set(a.id, a.gender)
+  } catch (_) {}
+  return m
+}
+
 ;(async () => {
   console.log('① 翻 JavDB 无码影片（type=1）反推演员…')
   const found = new Map()      // id → {name, codes:Set(番号样本)}
@@ -111,8 +166,10 @@ function loadFemaleNames() {
   }
   console.log('   无码影片反推共 ' + found.size + ' 位演员')
 
-  console.log('② 拉详情 + 性别判定（名册反查）…')
+  console.log('② 拉详情 + 性别判定…')
   const fem = loadFemaleNames()
+  const AF = loadActorsFullGender()
+  const PREV = loadPrevGender()
   const out = { fetchedAt: Date.now(), source: 'javdb-uncensored', count: 0, list: [] }
   const ids = [...found.keys()]
   let isFem = 0, isMale = 0
@@ -134,20 +191,55 @@ function loadFemaleNames() {
      * 前端按 gender 取女优即可，也不依赖名册。 */
     const keys = [base.name].concat(String(alias).split(','))
     const isFemale = keys.some(k => k && fem.has(onNorm(k)))
-    if (isFemale) isFem++; else isMale++
+    /* 三级性别：① actors_full.json 已判定的（同 id 直接复用）
+     *            ② 名册反查命中 = 女优
+     *            ③ 都没有 → 待复核（'?'），稍后问网页版 section-meta */
+    let g = AF.get(id) || null, gs = g ? 'actors_full' : ''
+    if (!g && isFemale) { g = 'f'; gs = 'roster' }
+    if (!g) { g = '?'; gs = 'pending-web' }
+    if (g === 'f') isFem++; else if (g === 'm') isMale++
     out.list.push({
       id,
       name: base.name,
       other_name: alias,
-      gender: isFemale ? 'f' : 'm',
+      gender: g,
+      genderSource: gs,
       videos_count: vc,
       uc_codes: [...base.codes].slice(0, 5),
       uc_count: base.codes.size,
       avatar_url: base.avatar_url || ''
     })
   })
+  /* ②b 待复核的问网页版 section-meta（名册/actors_full 都没判出来的那批） */
+  const pending = out.list.filter(r => r.gender === '?')
+  if (WEB_ON && pending.length) {
+    console.log('②b 性别复核（网页版 section-meta）：' + pending.length + ' 位…')
+    await pool(pending, 8, async r => {
+      const w = webGenderOf(r.id)
+      if (w) { r.gender = w; r.genderSource = 'javdb-web-section-meta' }
+      else {
+        // 拿不到页面 → 用上一版名单兜底（按 id / 名字），再不行才归男优
+        const p = PREV.map.get('id:' + r.id) || PREV.map.get('n:' + onNorm(r.name))
+        r.gender = p || 'm'
+        r.genderSource = p ? 'prev-list' : 'unverified'
+      }
+    })
+  }
+  isFem = out.list.filter(r => r.gender === 'f').length
+  isMale = out.count - isFem
+
   out.count = out.list.length
   out.list.sort((a, b) => (b.uc_count || 0) - (a.uc_count || 0) || (b.videos_count || 0) - (a.videos_count || 0))
+
+  /* ⚠️ 安全阀：网页版不可用 + 判定出的女优比上一版少太多 → 保留旧名单不覆盖。
+   * Actions 里没有 actresses.json（名册反查失效），万一 javdb.com 也取不到，
+   * 会把两千多个无码演员全判成男优 → 前端「无码女优」tab 直接空掉。宁可不更新。 */
+  const prevFemale = PREV.female
+  if (WEB_DEAD && prevFemale > 0 && isFem < prevFemale * 0.6) {
+    console.log(`⚠ 判定异常（女优 ${isFem} << 上一版 ${prevFemale}）且网页版不可用 → 保留旧名单，不覆盖`)
+    return
+  }
+
   // 直接覆盖写：tmp+rename 需要删除旧文件，会被沙箱文件策略拒绝
   fs.writeFileSync(OUT_JSON, JSON.stringify(out))
   console.log('③ relay/uncensored_actresses.json：无码演员 ' + out.count + ' 位（判为女优 ' + isFem + ' · 男优/未知名 ' + isMale + '）')
