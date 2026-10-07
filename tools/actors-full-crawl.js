@@ -22,8 +22,10 @@ function jdbSign() {
   return ts + '.' + JDB_P2 + '.' + crypto.createHash('md5').update(String(ts) + JDB_P1).digest('hex')
 }
 
-/* 产物目录：Actions 里是仓库根的 relay/；本地自测可用 RELAY_DIR 覆盖 */
-const RELAY_DIR = process.env.RELAY_DIR || path.join(__dirname, 'relay')
+/* 产物目录：Actions 里脚本在 tools/ 下跑，仓库根的 relay/ 在上一层；本地自测则与脚本同级。
+ * ⚠️ 之前默认写 path.join(__dirname,'relay') → Actions 里变成 tools/relay（不存在）→ ENOENT 整个 job 失败。 */
+const RELAY_DIR = process.env.RELAY_DIR ||
+  (path.basename(__dirname) === 'tools' ? path.join(__dirname, '..', 'relay') : path.join(__dirname, 'relay'))
 const AVA_DIR = path.join(RELAY_DIR, 'avatars_jdb')
 const OUT_JSON = path.join(RELAY_DIR, 'actors_full.json')
 const TIMEOUT = 20000
