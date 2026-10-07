@@ -24,8 +24,9 @@ function parseRankRows(html) {
     if (!/class="rnkno"/.test(chunk)) continue
     const rank = +((chunk.match(/rnkcnt">(\d+)/) || [])[1] || 0)
     const id = (chunk.match(/actress(\d+)\.html/) || [])[1]
-    const name = mnStrip((chunk.match(/<h2 class="ttl"><a[^>]*>([\s\S]*?)<\/a>/) || [])[1])
-    const works = +((chunk.match(/<td>\s*(\d{1,6})\s*<\/td>/) || [])[1] || 0)
+    // minnano 2026-10 起把女优名从 <h2 class="ttl"> 改成 <h3 class="ttl">，故用 h[23] 兼容
+    const name = mnStrip((chunk.match(/<h[23] class="ttl"><a[^>]*>([\s\S]*?)<\/a>/) || [])[1])
+    const works = +((chunk.match(/<td[^>]*>\s*(\d{1,6})\s*<\/td>/) || [])[1] || 0)
     if (rank && id && name) rows.push({ rank, id, name, works })
   }
   return rows
@@ -53,10 +54,20 @@ const pool = async (items, n, fn) => {   // 简易并发池
   const out = { fetchedAt: Date.now() }
   const ids = new Set()
   for (const [key, q] of modes) {
-    const html = await get(MN_BASE + q)
-    const rows = parseRankRows(html)
+    // minnano 2026-10 起每页 50 条、分页参数 &page=N；抓前 2 页去重后凑满 Top100
+    const seen = new Set()
+    let rows = []
+    for (let page = 1; page <= 2; page++) {
+      const sep = q.includes('?') ? '&' : '?'
+      const url = MN_BASE + q + (page === 1 ? '' : sep + 'page=' + page)
+      const html = await get(url)
+      const r = parseRankRows(html)
+      if (!r.length) break
+      for (const x of r) if (!seen.has(x.id)) { seen.add(x.id); rows.push(x) }
+      if (rows.length >= 100) break
+    }
     if (!rows.length) throw new Error('榜单解析为空：' + q)
-    out[key] = rows
+    out[key] = rows.slice(0, 100)
     for (const r of rows) ids.add(r.id)
     console.log(key + ' 榜：' + rows.length + ' 条')
   }
